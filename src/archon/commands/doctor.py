@@ -234,6 +234,32 @@ def _check_project_claude(project_path: Path) -> list[tuple[str, str, str]]:
     return rows
 
 
+def _opencode_config_path() -> Path:
+    return Path.home() / ".config" / "opencode" / "opencode.json"
+
+
+def _check_codex_mcp() -> list[tuple[str, str, str]]:
+    if not _has("codex"):
+        return [("codex archon-lean-lsp", "skipped", "codex not installed")]
+
+    r = _run(["codex", "mcp", "list"])
+    output = (r.stdout or "") + (r.stderr or "")
+    if "archon-lean-lsp" in output:
+        return [("codex archon-lean-lsp", "ok", "configured")]
+    return [("codex archon-lean-lsp", "warning", "not found")]
+
+
+def _check_opencode_mcp() -> list[tuple[str, str, str]]:
+    if not _has("opencode"):
+        return [("opencode archon-lean-lsp", "skipped", "opencode not installed")]
+
+    data = _read_json(_opencode_config_path())
+    server = (data.get("mcp") or {}).get("archon-lean-lsp")
+    if isinstance(server, dict) and server.get("enabled", True):
+        return [("opencode archon-lean-lsp", "ok", "configured")]
+    return [("opencode archon-lean-lsp", "warning", "not found")]
+
+
 def _check_sorry_count(project_path: Path) -> list[tuple[str, str, str]]:
     """Run sorry_analyzer if available."""
     rows: list[tuple[str, str, str]] = []
@@ -305,6 +331,10 @@ def doctor(
 
     section = _check_project_claude(resolved)
     log.results_table(section, title="Claude Config (.claude/)")
+    all_rows.extend(section)
+
+    section = _check_codex_mcp() + _check_opencode_mcp()
+    log.results_table(section, title="Agent CLI Config")
     all_rows.extend(section)
 
     # Sorry count

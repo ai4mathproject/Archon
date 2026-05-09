@@ -26,7 +26,7 @@ from archon.runner import (
     build_prover_prompt,
     build_review_prompt,
     claude_env,
-    run_claude,
+    run_agent,
 )
 from archon.state import (
     CostData,
@@ -40,7 +40,7 @@ from archon.state import (
     utcnow_iso,
     write_meta,
 )
-from archon.types import Stage
+from archon.types import AgentBackend, Stage
 
 
 def _data_path(sub_path: str = "") -> Path:
@@ -195,23 +195,34 @@ def _unset_prover_env(old: dict[str, str]) -> None:
 # ── preflight ─────────────────────────────────────────────────────────
 
 
-def _preflight(project_path: Path, state_dir: Path, dry_run: bool) -> None:
+def _preflight(project_path: Path, state_dir: Path, dry_run: bool, backend: AgentBackend) -> None:
     progress = state_dir / "PROGRESS.md"
 
     if not dry_run:
-        if not shutil.which("claude"):
-            log.error("Claude Code is not installed. Run: archon setup")
-            raise typer.Exit(1)
+        if backend == AgentBackend.codex:
+            if not shutil.which("codex"):
+                log.error("Codex CLI is not installed. Install it or run with --agent claude.")
+                raise typer.Exit(1)
+            log.success("Codex CLI is available")
+        elif backend == AgentBackend.opencode:
+            if not shutil.which("opencode"):
+                log.error("OpenCode CLI is not installed. Install it or run with --agent claude.")
+                raise typer.Exit(1)
+            log.success("OpenCode CLI is available")
+        else:
+            if not shutil.which("claude"):
+                log.error("Claude Code is not installed. Run: archon setup")
+                raise typer.Exit(1)
 
-        r = subprocess.run(
-            ["claude", "-p", "reply with OK", "--no-session-persistence"],
-            capture_output=True, text=True,
-            env=claude_env(),
-        )
-        if r.returncode != 0:
-            log.error("Claude Code cannot run. Check: claude auth and network.")
-            raise typer.Exit(1)
-        log.success("Claude Code is authenticated and ready")
+            r = subprocess.run(
+                ["claude", "-p", "reply with OK", "--no-session-persistence"],
+                capture_output=True, text=True,
+                env=claude_env(),
+            )
+            if r.returncode != 0:
+                log.error("Claude Code cannot run. Check: claude auth and network.")
+                raise typer.Exit(1)
+            log.success("Claude Code is authenticated and ready")
 
     if not progress.exists():
         log.error(f"No project state found. Run: archon init {project_path}")
@@ -253,6 +264,7 @@ def _run_single_prover(
     verbose_logs: bool,
     snap_dir: Path | None = None,
     project_path: Path | None = None,
+    backend: AgentBackend = AgentBackend.claude,
 ) -> bool:
     if snap_dir is not None and project_path is not None:
         old_env = _set_prover_env(
@@ -264,7 +276,13 @@ def _run_single_prover(
         old_env = None
 
     try:
-        return run_claude(prompt, cwd=cwd, log_base=log_base, verbose_logs=verbose_logs)
+        return run_agent(
+            prompt,
+            backend=backend,
+            cwd=cwd,
+            log_base=log_base,
+            verbose_logs=verbose_logs,
+        )
     finally:
         if old_env is not None:
             _unset_prover_env(old_env)
@@ -281,6 +299,7 @@ def _run_parallel_provers(
     verbose_logs: bool,
     dry_run: bool,
     dashboard_url: str | None = None,
+    backend: AgentBackend = AgentBackend.claude,
 ) -> None:
     progress = state_dir / "PROGRESS.md"
 
@@ -319,7 +338,13 @@ def _run_parallel_provers(
         )
         try:
             prompt = build_prover_prompt(project_name, project_path, state_dir, stage)
-            ok = run_claude(prompt, cwd=project_path, log_base=prover_log, verbose_logs=verbose_logs)
+            ok = run_agent(
+                prompt,
+                backend=backend,
+                cwd=project_path,
+                log_base=prover_log,
+                verbose_logs=verbose_logs,
+            )
         finally:
             _unset_prover_env(old_env)
 
@@ -359,6 +384,7 @@ def _run_parallel_provers(
                 verbose_logs,
                 snap_dir,
                 project_path,
+                backend,
             )
             futures[future] = (rel, slug)
 
@@ -399,6 +425,7 @@ def _run_review_phase(
     stage: str,
     iter_dir: Path,
     verbose_logs: bool,
+    backend: AgentBackend = AgentBackend.claude,
 ) -> None:
     session_num = next_session_num(state_dir)
     journal_dir = state_dir / "proof-journal"
@@ -431,7 +458,13 @@ def _run_review_phase(
         session_num, session_dir, attempts_file, combined,
     )
     review_log = iter_dir / "review"
-    run_claude(prompt, cwd=project_path, log_base=review_log, verbose_logs=verbose_logs)
+    run_agent(
+        prompt,
+        backend=backend,
+        cwd=project_path,
+        log_base=review_log,
+        verbose_logs=verbose_logs,
+    )
 
     validate_script = _data_path("scripts/validate-review.py")
     if validate_script.exists():
@@ -480,6 +513,12 @@ def loop(
         False, "--open",
         help="Open the dashboard in a browser as soon as it starts.",
     ),
+    agent: AgentBackend = typer.Option(
+        AgentBackend.claude,
+        "--agent",
+        case_sensitive=False,
+        help="Agent CLI used for plan/prover/review phases.",
+    ),
 ) -> None:
     """Start the automated plan → prove → review loop.
 
@@ -495,7 +534,7 @@ def loop(
     log_dir = state_dir / "logs"
     force_stage = stage.value if stage else None
 
-    _preflight(resolved, state_dir, dry_run)
+    _preflight(resolved, state_dir, dry_run, agent)
 
     if not dry_run:
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -516,6 +555,7 @@ def loop(
         "Prover mode": prover_mode,
         "Review": "enabled" if not no_review else "disabled",
         "Dashboard": "disabled" if no_dashboard else "enabled",
+        "Agent": agent.value,
         "Logs": str(log_dir),
         "User hints": str(state_dir / "USER_HINTS.md"),
     }
@@ -604,7 +644,13 @@ def loop(
                 print(plan_prompt)
             else:
                 plan_log = iter_dir / "plan"
-                run_claude(plan_prompt, cwd=resolved, log_base=plan_log, verbose_logs=verbose_logs)
+                run_agent(
+                    plan_prompt,
+                    backend=agent,
+                    cwd=resolved,
+                    log_base=plan_log,
+                    verbose_logs=verbose_logs,
+                )
 
             plan_secs = int(time.monotonic() - plan_start)
             log.info(f"Plan phase finished. ({plan_secs}s)")
@@ -628,7 +674,7 @@ def loop(
                 _run_parallel_provers(
                     project_name, resolved, state_dir, current_stage,
                     iter_dir, iter_meta, max_parallel, verbose_logs, dry_run,
-                    dashboard_url=dashboard_url,
+                    dashboard_url=dashboard_url, backend=agent,
                 )
             else:
                 prover_prompt = build_prover_prompt(project_name, resolved, state_dir, current_stage)
@@ -652,7 +698,13 @@ def loop(
                         serial_mode=True,
                     )
                     try:
-                        run_claude(prover_prompt, cwd=resolved, log_base=prover_log, verbose_logs=verbose_logs)
+                        run_agent(
+                            prover_prompt,
+                            backend=agent,
+                            cwd=resolved,
+                            log_base=prover_log,
+                            verbose_logs=verbose_logs,
+                        )
                     finally:
                         _unset_prover_env(old_env)
 
@@ -672,7 +724,7 @@ def loop(
 
                 _run_review_phase(
                     project_name, resolved, state_dir, current_stage,
-                    iter_dir, verbose_logs,
+                    iter_dir, verbose_logs, backend=agent,
                 )
 
                 review_secs = int(time.monotonic() - review_start)

@@ -10,7 +10,8 @@ from pathlib import Path
 import typer
 
 from archon import log
-from archon.runner import claude_env
+from archon.runner import claude_env, run_agent
+from archon.types import AgentBackend
 
 
 # ── helpers ───────────────────────────────────────────────────────────
@@ -92,6 +93,60 @@ def _update_gitignore(project_path: Path, entry: str) -> None:
         with gitignore.open("a", encoding="utf-8") as f:
             f.write(f"\n# Archon state directory\n{entry}\n")
         log.success(f"Added {entry} to .gitignore")
+
+
+def _opencode_config_path() -> Path:
+    return Path.home() / ".config" / "opencode" / "opencode.json"
+
+
+def _write_opencode_mcp_config(lean_lsp_dir: Path) -> None:
+    config_path = _opencode_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data: dict = {}
+    if config_path.exists():
+        data = _read_json(config_path)
+
+    data.setdefault("$schema", "https://opencode.ai/config.json")
+    mcp = data.setdefault("mcp", {})
+    mcp["archon-lean-lsp"] = {
+        "type": "local",
+        "command": ["uv", "run", "--directory", str(lean_lsp_dir), "lean-lsp-mcp"],
+        "enabled": True,
+        "timeout": 30000,
+    }
+
+    config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _require_agent_cli(agent: AgentBackend) -> None:
+    binary = {
+        AgentBackend.claude: "claude",
+        AgentBackend.codex: "codex",
+        AgentBackend.opencode: "opencode",
+    }[agent]
+    if _has(binary):
+        return
+
+    if agent == AgentBackend.claude:
+        log.error("Claude Code is not installed")
+        log.step("Run: archon setup")
+    elif agent == AgentBackend.codex:
+        log.error("Codex CLI is not installed")
+        log.step("Install Codex or run: archon init --agent claude")
+    else:
+        log.error("OpenCode CLI is not installed")
+        log.step("Install OpenCode or run: archon init --agent claude")
+    raise typer.Exit(1)
+
+
+def _agent_specific_setup(project_path: Path, fresh: bool, backend: AgentBackend) -> None:
+    if backend != AgentBackend.claude:
+        log.step(f"Skipping Claude plugin setup for --agent {backend.value}")
+        return
+
+    _step4_skills(project_path, fresh=fresh)
+    _step5_disable_conflicting_plugins(project_path)
 
 
 # ── re-init detection ─────────────────────────────────────────────────
@@ -384,11 +439,33 @@ def _step2_copy_prompts(state_dir: Path, fresh: bool) -> None:
     log.step("To customize: edit files directly in .archon/prompts/")
 
 
-def _step3_lean_lsp_mcp(project_path: Path, fresh: bool) -> None:
+def _step3_lean_lsp_mcp(
+    project_path: Path,
+    fresh: bool,
+    backend: AgentBackend = AgentBackend.claude,
+) -> None:
     """Install lean-lsp MCP server at project scope."""
     log.phase(3, "Installing lean-lsp MCP server (project scope)")
 
     lean_lsp_dir = _data_path("tools/lean-lsp-mcp")
+
+    if backend == AgentBackend.codex:
+        r = _run(
+            ["codex", "mcp", "add", "archon-lean-lsp", "--",
+             "uv", "run", "--directory", str(lean_lsp_dir), "lean-lsp-mcp"],
+            cwd=project_path,
+        )
+        output = r.stdout + r.stderr
+        if r.returncode == 0 or "already" in output.lower():
+            log.success("codex archon-lean-lsp configured")
+        else:
+            log.error(f"Failed to add codex archon-lean-lsp: {output.strip()}")
+        return
+
+    if backend == AgentBackend.opencode:
+        _write_opencode_mcp_config(lean_lsp_dir)
+        log.success(f"opencode archon-lean-lsp configured in {_opencode_config_path()}")
+        return
 
     existing = _run(["claude", "mcp", "list"], cwd=project_path)
     already_registered = "archon-lean-lsp" in (existing.stdout or "")
@@ -526,8 +603,13 @@ def _step5_disable_conflicting_plugins(project_path: Path) -> None:
     log.step("Your global lean4-skills is untouched in all other projects")
 
 
-def _step6_interactive_claude(project_path: Path, state_dir: Path, fresh: bool) -> None:
-    """Launch interactive Claude Code session if still in init stage."""
+def _step6_initial_agent(
+    project_path: Path,
+    state_dir: Path,
+    *,
+    backend: AgentBackend,
+) -> None:
+    """Launch the selected agent for initial setup if still in init stage."""
     stage = _parse_stage(state_dir / "PROGRESS.md")
     project_name = project_path.name
 
@@ -537,7 +619,10 @@ def _step6_interactive_claude(project_path: Path, state_dir: Path, fresh: bool) 
         return
 
     log.header(f"Initializing project: {project_name}")
-    log.step("Claude will check the project state and guide you through setup")
+    if backend == AgentBackend.claude:
+        log.step("Claude will check the project state and guide you through setup")
+    else:
+        log.step(f"{backend.value} will check the project state and guide you through setup")
 
     prompt = textwrap.dedent(f"""\
         You are in the init stage for project '{project_name}' at {project_path}. \
@@ -553,12 +638,15 @@ def _step6_interactive_claude(project_path: Path, state_dir: Path, fresh: bool) 
         When the user has confirmed and you have finished the init steps, run \
         /archon-lean4:doctor to verify the full setup before exiting.""")
 
-    subprocess.run(
-        ["claude", "--dangerously-skip-permissions", "--permission-mode",
-         "bypassPermissions", prompt],
-        cwd=project_path,
-        env=claude_env(),
-    )
+    if backend == AgentBackend.claude:
+        subprocess.run(
+            ["claude", "--dangerously-skip-permissions", "--permission-mode",
+             "bypassPermissions", prompt],
+            cwd=project_path,
+            env=claude_env(),
+        )
+    else:
+        run_agent(prompt, backend=backend, cwd=project_path)
 
     new_stage = _parse_stage(state_dir / "PROGRESS.md")
     if new_stage == "init":
@@ -582,6 +670,12 @@ def init(
         False, "--force",
         help="Skip the re-init prompt and overwrite existing Archon files. "
         "Use with care — this discards local prompt/CLAUDE.md edits.",
+    ),
+    agent: AgentBackend = typer.Option(
+        AgentBackend.claude,
+        "--agent",
+        case_sensitive=False,
+        help="Agent CLI setup to configure for this project.",
     ),
 ) -> None:
     """
@@ -627,10 +721,7 @@ def init(
         "State dir": str(state_dir),
     })
 
-    if not _has("claude"):
-        log.error("Claude Code is not installed")
-        log.step("Run: archon setup")
-        raise typer.Exit(1)
+    _require_agent_cli(agent)
 
     # ── Re-init detection ────────────────────────────────────────
     info = _detect_existing_archon(state_dir)
@@ -652,9 +743,8 @@ def init(
 
         if mode == "keep":
             log.info("Keeping existing setup. Verifying MCP / plugin registration only.")
-            _step3_lean_lsp_mcp(resolved, fresh=False)
-            _step4_skills(resolved, fresh=False)
-            _step5_disable_conflicting_plugins(resolved)
+            _step3_lean_lsp_mcp(resolved, fresh=False, backend=agent)
+            _agent_specific_setup(resolved, fresh=False, backend=agent)
             log.success("Verification complete.")
             return
 
@@ -674,14 +764,13 @@ def init(
         refresh_claude_md=not merged_claude_md,
     )
     _step2_copy_prompts(state_dir, fresh=fresh)
-    _step3_lean_lsp_mcp(resolved, fresh=fresh)
-    _step4_skills(resolved, fresh=fresh)
-    _step5_disable_conflicting_plugins(resolved)
+    _step3_lean_lsp_mcp(resolved, fresh=fresh, backend=agent)
+    _agent_specific_setup(resolved, fresh=fresh, backend=agent)
 
     # If this was a merge run, PROGRESS.md already exists and the user has
     # a valid setup — skip the interactive init session.
     if fresh:
-        _step6_interactive_claude(resolved, state_dir, fresh=fresh)
+        _step6_initial_agent(resolved, state_dir, backend=agent)
     else:
         log.success("Merge-based re-init complete.")
         log.step(f"Next: archon loop {resolved}")

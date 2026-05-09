@@ -14,6 +14,7 @@ from textwrap import dedent
 import os
 
 from archon import log
+from archon.types import AgentBackend
 
 
 def claude_env() -> dict[str, str]:
@@ -197,6 +198,166 @@ if RAW: RAW.close()
 '''
 
 
+def _normalize_opencode_tool_name(tool: str) -> str:
+    mapping = {
+        "bash": "Bash",
+        "read": "Read",
+        "write": "Write",
+        "edit": "Edit",
+        "grep": "Grep",
+        "glob": "Glob",
+    }
+    return mapping.get(tool, tool)
+
+
+def codex_event_to_archon_events(
+    raw: dict,
+    *,
+    last_result: str = "",
+    session_id: str = "",
+) -> list[dict]:
+    """Convert one `codex exec --json` event into Archon's dashboard JSONL events."""
+    event_type = raw.get("type")
+
+    if event_type == "item.completed":
+        item = raw.get("item") or {}
+        item_type = item.get("type")
+        if item_type == "agent_message":
+            text = (item.get("text") or "").strip()
+            return [{"event": "text", "content": text}] if text else []
+        if item_type in {"tool_call", "function_call"}:
+            return [{
+                "event": "tool_call",
+                "tool": item.get("name") or item.get("tool") or item_type,
+                "input": item.get("arguments") or item.get("input") or {},
+            }]
+        if item_type in {"tool_result", "function_call_output"}:
+            content = item.get("text") or item.get("output") or item.get("content") or ""
+            return [{"event": "tool_result", "content": str(content)}]
+        return []
+
+    if event_type == "turn.completed":
+        usage = raw.get("usage") or {}
+        input_tokens = usage.get("input_tokens", 0) or 0
+        output_tokens = usage.get("output_tokens", 0) or 0
+        cached_input_tokens = usage.get("cached_input_tokens", 0) or 0
+        return [{
+            "event": "session_end",
+            "session_id": session_id,
+            "total_cost_usd": 0,
+            "duration_ms": 0,
+            "duration_api_ms": 0,
+            "num_turns": 1,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": cached_input_tokens,
+            "cache_creation_input_tokens": 0,
+            "model_usage": {
+                "codex": {
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "costUSD": 0,
+                }
+            },
+            "summary": last_result,
+        }]
+
+    return []
+
+
+def opencode_event_to_archon_events(
+    raw: dict,
+    *,
+    last_result: str = "",
+    session_id: str = "",
+) -> list[dict]:
+    """Convert one `opencode run --format json` event into Archon's dashboard JSONL events."""
+    event_type = raw.get("type")
+    effective_session_id = raw.get("sessionID") or session_id
+
+    if event_type == "text":
+        part = raw.get("part") or {}
+        text = (part.get("text") or "").strip()
+        return [{"event": "text", "content": text}] if text else []
+
+    if event_type == "tool_use":
+        part = raw.get("part") or {}
+        state = part.get("state") or {}
+        tool = _normalize_opencode_tool_name(part.get("tool") or "tool")
+        tool_input = state.get("input") or {}
+        output = state.get("output")
+        if output is None:
+            metadata = state.get("metadata") or {}
+            output = metadata.get("output") or ""
+        return [
+            {"event": "tool_call", "tool": tool, "input": tool_input},
+            {"event": "tool_result", "content": str(output)},
+        ]
+
+    if event_type == "step_finish":
+        part = raw.get("part") or {}
+        if part.get("reason") not in (None, "stop"):
+            return []
+        tokens = part.get("tokens") or {}
+        cache = tokens.get("cache") or {}
+        input_tokens = tokens.get("input", 0) or 0
+        output_tokens = tokens.get("output", 0) or 0
+        cost = part.get("cost", 0) or 0
+        return [{
+            "event": "session_end",
+            "session_id": effective_session_id,
+            "total_cost_usd": cost,
+            "duration_ms": 0,
+            "duration_api_ms": 0,
+            "num_turns": 1,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache.get("read", 0) or 0,
+            "cache_creation_input_tokens": cache.get("write", 0) or 0,
+            "model_usage": {
+                "opencode": {
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "costUSD": cost,
+                }
+            },
+            "summary": last_result,
+        }]
+
+    return []
+
+
+def _parse_agent_jsonl_stream(lines, jsonl_path: Path, *, converter) -> str:
+    """Write Archon JSONL rows parsed from an agent JSON stream and return final text."""
+    session_id = ""
+    last_result = ""
+
+    with jsonl_path.open("a") as out:
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if raw.get("type") == "thread.started":
+                session_id = raw.get("thread_id") or session_id
+                continue
+            if raw.get("sessionID"):
+                session_id = raw.get("sessionID") or session_id
+
+            events = converter(raw, last_result=last_result, session_id=session_id)
+            for event in events:
+                if event.get("event") == "text":
+                    last_result = event.get("content", "")
+                out.write(json.dumps(event) + "\n")
+                out.flush()
+
+    return last_result
+
+
 # ── run_claude ────────────────────────────────────────────────────────
 
 
@@ -264,3 +425,130 @@ def run_claude(
     else:
         r = subprocess.run(claude_cmd, cwd=cwd, env=claude_env())
         return r.returncode == 0
+
+
+def _run_json_agent_process(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    log_base: Path | None,
+    verbose_logs: bool,
+    converter,
+) -> bool:
+    if log_base is None:
+        r = subprocess.run(cmd, cwd=cwd, env=claude_env(), stdin=subprocess.DEVNULL)
+        return r.returncode == 0
+
+    log_base.parent.mkdir(parents=True, exist_ok=True)
+    jsonl = Path(f"{log_base}.jsonl")
+    raw_log = Path(f"{log_base}.raw.jsonl")
+    stderr_dest = raw_log if verbose_logs else Path(os.devnull)
+
+    with stderr_dest.open("a") as stderr_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            stdin=subprocess.DEVNULL,
+            cwd=cwd,
+            env=claude_env(),
+            text=True,
+        )
+        assert proc.stdout is not None
+        final_text = _parse_agent_jsonl_stream(proc.stdout, jsonl, converter=converter)
+        proc.wait()
+
+    if final_text:
+        print(final_text, flush=True)
+    return proc.returncode == 0
+
+
+def run_codex(
+    prompt: str,
+    *,
+    cwd: Path,
+    log_base: Path | None = None,
+    verbose_logs: bool = False,
+    extra_args: list[str] | None = None,
+) -> bool:
+    cmd = [
+        "codex",
+        "exec",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-C",
+        str(cwd),
+        prompt,
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    return _run_json_agent_process(
+        cmd,
+        cwd=cwd,
+        log_base=log_base,
+        verbose_logs=verbose_logs,
+        converter=codex_event_to_archon_events,
+    )
+
+
+def run_opencode(
+    prompt: str,
+    *,
+    cwd: Path,
+    log_base: Path | None = None,
+    verbose_logs: bool = False,
+    extra_args: list[str] | None = None,
+) -> bool:
+    cmd = [
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--dangerously-skip-permissions",
+        "--dir",
+        str(cwd),
+        prompt,
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    return _run_json_agent_process(
+        cmd,
+        cwd=cwd,
+        log_base=log_base,
+        verbose_logs=verbose_logs,
+        converter=opencode_event_to_archon_events,
+    )
+
+
+def run_agent(
+    prompt: str,
+    *,
+    backend: AgentBackend,
+    cwd: Path,
+    log_base: Path | None = None,
+    verbose_logs: bool = False,
+    extra_args: list[str] | None = None,
+) -> bool:
+    if backend == AgentBackend.codex:
+        return run_codex(
+            prompt,
+            cwd=cwd,
+            log_base=log_base,
+            verbose_logs=verbose_logs,
+            extra_args=extra_args,
+        )
+    if backend == AgentBackend.opencode:
+        return run_opencode(
+            prompt,
+            cwd=cwd,
+            log_base=log_base,
+            verbose_logs=verbose_logs,
+            extra_args=extra_args,
+        )
+    return run_claude(
+        prompt,
+        cwd=cwd,
+        log_base=log_base,
+        verbose_logs=verbose_logs,
+        extra_args=extra_args,
+    )

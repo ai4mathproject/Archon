@@ -7,3 +7,9 @@ class Stage(str, Enum):
     autoformalize = "autoformalize"
     prover = "prover"
     polish = "polish"
+
+
+class AgentBackend(str, Enum):
+    claude = "claude"
+    codex = "codex"
+    opencode = "opencode"

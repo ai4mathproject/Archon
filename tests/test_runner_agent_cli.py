@@ -1,4 +1,5 @@
 import json
+import sys
 
 from archon.runner import codex_event_to_archon_events, opencode_event_to_archon_events
 
@@ -144,6 +145,85 @@ def test_parse_agent_jsonl_stream_ignores_non_json_lines(tmp_path):
     assert [row["event"] for row in rows] == ["text", "session_end"]
     assert rows[0]["content"] == "OK"
     assert rows[1]["session_id"] == "thread-1"
+
+
+def test_json_agent_process_requires_terminal_session_end(tmp_path):
+    from archon.runner import _run_json_agent_process
+
+    log_base = tmp_path / "agent"
+    cmd = [
+        sys.executable,
+        "-c",
+        "import json; print(json.dumps({'type':'text','part':{'text':'still working'}}))",
+    ]
+
+    ok = _run_json_agent_process(
+        cmd,
+        cwd=tmp_path,
+        log_base=log_base,
+        verbose_logs=False,
+        converter=opencode_event_to_archon_events,
+    )
+
+    assert ok is False
+
+
+def test_json_agent_process_requires_terminal_session_end_without_log(tmp_path):
+    from archon.runner import _run_json_agent_process
+
+    cmd = [
+        sys.executable,
+        "-c",
+        "import json; print(json.dumps({'type':'text','part':{'text':'still working'}}))",
+    ]
+
+    ok = _run_json_agent_process(
+        cmd,
+        cwd=tmp_path,
+        log_base=None,
+        verbose_logs=False,
+        converter=opencode_event_to_archon_events,
+    )
+
+    assert ok is False
+
+
+def test_json_agent_process_idle_timeout_kills_silent_process(tmp_path):
+    from archon.runner import _run_json_agent_process
+
+    log_base = tmp_path / "agent"
+    cmd = [sys.executable, "-c", "import time; time.sleep(5)"]
+
+    ok = _run_json_agent_process(
+        cmd,
+        cwd=tmp_path,
+        log_base=log_base,
+        verbose_logs=False,
+        converter=opencode_event_to_archon_events,
+        idle_timeout_secs=0.1,
+    )
+
+    assert ok is False
+
+
+def test_run_opencode_injects_project_boundary_instructions(monkeypatch, tmp_path):
+    from archon import runner
+
+    calls = []
+
+    def fake_run_json_agent_process(cmd, **kwargs):
+        calls.append(cmd)
+        return True
+
+    monkeypatch.setattr(runner, "_run_json_agent_process", fake_run_json_agent_process)
+
+    ok = runner.run_opencode("Do the work.", cwd=tmp_path)
+
+    assert ok is True
+    prompt = calls[0][-1]
+    assert "OpenCode-specific Archon rules" in prompt
+    assert "Do not inspect, grep, glob, find, or count files under `.lake/`" in prompt
+    assert "Use `lake build`" in prompt
 
 
 def test_run_agent_dispatches_to_codex(monkeypatch, tmp_path):

@@ -415,6 +415,90 @@ def _run_parallel_provers(
     _emit_parallel_round_end(iter_dir, file_count, failed)
 
 
+def _run_serial_prover(
+    project_name: str,
+    project_path: Path,
+    state_dir: Path,
+    stage: str,
+    iter_dir: Path,
+    iter_meta: Path,
+    verbose_logs: bool,
+    dry_run: bool,
+    backend: AgentBackend = AgentBackend.claude,
+) -> bool:
+    prover_prompt = build_prover_prompt(project_name, project_path, state_dir, stage)
+    if dry_run:
+        log.step("[dry-run] Prover prompt:")
+        print(prover_prompt)
+        return True
+
+    prover_log = iter_dir / "prover"
+    progress_file = state_dir / "PROGRESS.md"
+    sorry_files = parse_objective_files(progress_file, project_path)
+    if sorry_files:
+        for sf in sorry_files:
+            srel = _relpath(sf, project_path)
+            sslug = _file_slug(srel)
+            ssnap = iter_dir / "snapshots" / sslug
+            _snapshot_baseline(sf, ssnap)
+
+    old_env = _set_prover_env(
+        snap_dir=iter_dir / "snapshots",
+        prover_jsonl=Path(str(prover_log) + ".jsonl"),
+        project_path=project_path,
+        serial_mode=True,
+    )
+    try:
+        ok = run_agent(
+            prover_prompt,
+            backend=backend,
+            cwd=project_path,
+            log_base=prover_log,
+            verbose_logs=verbose_logs,
+        )
+    finally:
+        _unset_prover_env(old_env)
+
+    write_meta(iter_meta, **{"prover.status": "done" if ok else "error"})
+    if not ok:
+        log.warn("Serial prover agent had errors")
+    return ok
+
+
+# ── plan phase ────────────────────────────────────────────────────────
+
+
+def _run_plan_agent(
+    project_name: str,
+    project_path: Path,
+    state_dir: Path,
+    stage: str,
+    iter_dir: Path,
+    iter_meta: Path,
+    verbose_logs: bool,
+    dry_run: bool,
+    backend: AgentBackend = AgentBackend.claude,
+) -> bool:
+    plan_prompt = build_plan_prompt(project_name, project_path, state_dir, stage)
+    if dry_run:
+        log.step("[dry-run] Plan prompt:")
+        print(plan_prompt)
+        return True
+
+    plan_log = iter_dir / "plan"
+    ok = run_agent(
+        plan_prompt,
+        backend=backend,
+        cwd=project_path,
+        log_base=plan_log,
+        verbose_logs=verbose_logs,
+    )
+    write_meta(iter_meta, **{"plan.status": "done" if ok else "error"})
+    if not ok:
+        log.warn("Plan agent had errors")
+    return ok
+
+
 # ── review phase ──────────────────────────────────────────────────────
 
 
@@ -424,9 +508,10 @@ def _run_review_phase(
     state_dir: Path,
     stage: str,
     iter_dir: Path,
+    iter_meta: Path,
     verbose_logs: bool,
     backend: AgentBackend = AgentBackend.claude,
-) -> None:
+) -> bool:
     session_num = next_session_num(state_dir)
     journal_dir = state_dir / "proof-journal"
     session_dir = journal_dir / "sessions" / f"session_{session_num}"
@@ -458,7 +543,7 @@ def _run_review_phase(
         session_num, session_dir, attempts_file, combined,
     )
     review_log = iter_dir / "review"
-    run_agent(
+    ok = run_agent(
         prompt,
         backend=backend,
         cwd=project_path,
@@ -472,6 +557,10 @@ def _run_review_phase(
             [sys.executable, str(validate_script), str(session_dir), str(attempts_file)],
             capture_output=True,
         )
+    write_meta(iter_meta, **{"review.status": "done" if ok else "error"})
+    if not ok:
+        log.warn("Review agent had errors")
+    return ok
 
 
 # ── main command ──────────────────────────────────────────────────────
@@ -637,25 +726,29 @@ def loop(
             log.phase(1, "Plan agent")
 
             plan_start = time.monotonic()
-            plan_prompt = build_plan_prompt(project_name, resolved, state_dir, current_stage)
-
-            if dry_run:
-                log.step("[dry-run] Plan prompt:")
-                print(plan_prompt)
-            else:
-                plan_log = iter_dir / "plan"
-                run_agent(
-                    plan_prompt,
-                    backend=agent,
-                    cwd=resolved,
-                    log_base=plan_log,
-                    verbose_logs=verbose_logs,
-                )
+            _run_plan_agent(
+                project_name,
+                resolved,
+                state_dir,
+                current_stage,
+                iter_dir,
+                iter_meta,
+                verbose_logs,
+                dry_run,
+                backend=agent,
+            )
 
             plan_secs = int(time.monotonic() - plan_start)
             log.info(f"Plan phase finished. ({plan_secs}s)")
             if not dry_run:
-                write_meta(iter_meta, **{"plan.status": "done", "plan.durationSecs": plan_secs})
+                meta_data = {}
+                if iter_meta.exists():
+                    try:
+                        meta_data = json.loads(iter_meta.read_text())
+                    except json.JSONDecodeError:
+                        meta_data = {}
+                plan_status = (meta_data.get("plan") or {}).get("status", "done")
+                write_meta(iter_meta, **{"plan.status": plan_status, "plan.durationSecs": plan_secs})
 
             if is_complete(progress_file, force_stage):
                 log.success("PROGRESS.md says COMPLETE. Exiting loop.")
@@ -677,43 +770,31 @@ def loop(
                     dashboard_url=dashboard_url, backend=agent,
                 )
             else:
-                prover_prompt = build_prover_prompt(project_name, resolved, state_dir, current_stage)
-                if dry_run:
-                    log.step("[dry-run] Prover prompt:")
-                    print(prover_prompt)
-                else:
-                    prover_log = iter_dir / "prover"
-                    sorry_files = parse_objective_files(progress_file, resolved)
-                    if sorry_files:
-                        for sf in sorry_files:
-                            srel = _relpath(sf, resolved)
-                            sslug = _file_slug(srel)
-                            ssnap = iter_dir / "snapshots" / sslug
-                            _snapshot_baseline(sf, ssnap)
-
-                    old_env = _set_prover_env(
-                        snap_dir=iter_dir / "snapshots",
-                        prover_jsonl=Path(str(prover_log) + ".jsonl"),
-                        project_path=resolved,
-                        serial_mode=True,
-                    )
-                    try:
-                        run_agent(
-                            prover_prompt,
-                            backend=agent,
-                            cwd=resolved,
-                            log_base=prover_log,
-                            verbose_logs=verbose_logs,
-                        )
-                    finally:
-                        _unset_prover_env(old_env)
+                _run_serial_prover(
+                    project_name,
+                    resolved,
+                    state_dir,
+                    current_stage,
+                    iter_dir,
+                    iter_meta,
+                    verbose_logs,
+                    dry_run,
+                    backend=agent,
+                )
 
             prover_secs = int(time.monotonic() - prover_start)
             log.info(f"Prover phase finished. ({prover_secs}s)")
             if dashboard_url:
                 log.step(f"Inspect diffs: {dashboard_url}/diffs")
             if not dry_run:
-                write_meta(iter_meta, **{"prover.status": "done", "prover.durationSecs": prover_secs})
+                meta_data = {}
+                if iter_meta.exists():
+                    try:
+                        meta_data = json.loads(iter_meta.read_text())
+                    except json.JSONDecodeError:
+                        meta_data = {}
+                prover_status = (meta_data.get("prover") or {}).get("status", "done")
+                write_meta(iter_meta, **{"prover.status": prover_status, "prover.durationSecs": prover_secs})
 
             # ── Phase 3: Review ──
             if not no_review and not dry_run:
@@ -724,14 +805,21 @@ def loop(
 
                 _run_review_phase(
                     project_name, resolved, state_dir, current_stage,
-                    iter_dir, verbose_logs, backend=agent,
+                    iter_dir, iter_meta, verbose_logs, backend=agent,
                 )
 
                 review_secs = int(time.monotonic() - review_start)
                 log.info(f"Review phase finished. ({review_secs}s)")
                 if dashboard_url:
                     log.step(f"Journal:       {dashboard_url}/journal")
-                write_meta(iter_meta, **{"review.status": "done", "review.durationSecs": review_secs})
+                meta_data = {}
+                if iter_meta.exists():
+                    try:
+                        meta_data = json.loads(iter_meta.read_text())
+                    except json.JSONDecodeError:
+                        meta_data = {}
+                review_status = (meta_data.get("review") or {}).get("status", "done")
+                write_meta(iter_meta, **{"review.status": review_status, "review.durationSecs": review_secs})
 
             iter_secs = int(time.monotonic() - iter_start)
             log.info(f"Iteration {i + 1} complete. Wall time: {iter_secs}s")

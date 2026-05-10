@@ -6,8 +6,11 @@ Wraps `claude -p` with stream-json parsing, cost tracking, and log output.
 from __future__ import annotations
 
 import json
+import selectors
 import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from textwrap import dedent
@@ -327,10 +330,15 @@ def opencode_event_to_archon_events(
     return []
 
 
-def _parse_agent_jsonl_stream(lines, jsonl_path: Path, *, converter) -> str:
-    """Write Archon JSONL rows parsed from an agent JSON stream and return final text."""
+def _parse_agent_jsonl_stream(lines, jsonl_path: Path, *, converter) -> tuple[str, bool]:
+    """Write Archon JSONL rows parsed from an agent JSON stream.
+
+    Returns (final_text, saw_session_end). A clean process exit without a terminal
+    session event is not a completed agent turn for Codex/OpenCode.
+    """
     session_id = ""
     last_result = ""
+    saw_session_end = False
 
     with jsonl_path.open("a") as out:
         for line in lines:
@@ -352,10 +360,27 @@ def _parse_agent_jsonl_stream(lines, jsonl_path: Path, *, converter) -> str:
             for event in events:
                 if event.get("event") == "text":
                     last_result = event.get("content", "")
+                if event.get("event") == "session_end":
+                    saw_session_end = True
                 out.write(json.dumps(event) + "\n")
                 out.flush()
 
-    return last_result
+    return last_result, saw_session_end
+
+
+def _opencode_prompt(prompt: str) -> str:
+    """Add OpenCode-specific guardrails without changing Archon's shared prompts."""
+    return dedent(f"""\
+        OpenCode-specific Archon rules:
+        - Treat `.archon/CLAUDE.md` as Archon's local instruction file even though you are OpenCode.
+        - Do not inspect, grep, glob, find, or count files under `.lake/`, `lake-packages/`, `.git/`, or `.archon/logs/`.
+        - When counting Lean obligations, inspect only project-owned `.lean` files outside `.lake/` and `.archon/logs/`.
+        - Use `lake build` from the project root to verify Lean compilation before reporting completion.
+        - If `lake build` fails, the task is not complete; keep working or write a concrete failure report to `.archon/task_results/`.
+        - Prefer the configured `archon-lean-lsp` MCP tools for Lean diagnostics and search when available.
+
+        {prompt}
+        """)
 
 
 # ── run_claude ────────────────────────────────────────────────────────
@@ -434,10 +459,18 @@ def _run_json_agent_process(
     log_base: Path | None,
     verbose_logs: bool,
     converter,
+    idle_timeout_secs: float | None = None,
 ) -> bool:
     if log_base is None:
-        r = subprocess.run(cmd, cwd=cwd, env=claude_env(), stdin=subprocess.DEVNULL)
-        return r.returncode == 0
+        with tempfile.TemporaryDirectory(prefix="archon-agent-") as tmp:
+            return _run_json_agent_process(
+                cmd,
+                cwd=cwd,
+                log_base=Path(tmp) / "agent",
+                verbose_logs=False,
+                converter=converter,
+                idle_timeout_secs=idle_timeout_secs,
+            )
 
     log_base.parent.mkdir(parents=True, exist_ok=True)
     jsonl = Path(f"{log_base}.jsonl")
@@ -455,12 +488,51 @@ def _run_json_agent_process(
             text=True,
         )
         assert proc.stdout is not None
-        final_text = _parse_agent_jsonl_stream(proc.stdout, jsonl, converter=converter)
+        lines = proc.stdout
+        if idle_timeout_secs is not None:
+            lines = _iter_lines_with_idle_timeout(proc, idle_timeout_secs)
+        final_text, saw_session_end = _parse_agent_jsonl_stream(lines, jsonl, converter=converter)
         proc.wait()
 
     if final_text:
         print(final_text, flush=True)
-    return proc.returncode == 0
+    if proc.returncode != 0:
+        return False
+    if not saw_session_end:
+        log.warn(f"Agent process exited without a terminal session event: {' '.join(cmd[:2])}")
+        return False
+    return True
+
+
+def _iter_lines_with_idle_timeout(proc: subprocess.Popen, idle_timeout_secs: float):
+    assert proc.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    try:
+        while True:
+            if proc.poll() is not None:
+                remaining = proc.stdout.readline()
+                while remaining:
+                    yield remaining
+                    remaining = proc.stdout.readline()
+                break
+
+            ready = selector.select(timeout=idle_timeout_secs)
+            if not ready:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                log.warn(f"Agent process idle for {idle_timeout_secs:g}s; killed")
+                break
+
+            line = proc.stdout.readline()
+            if line:
+                yield line
+            else:
+                time.sleep(0.01)
+    finally:
+        selector.close()
 
 
 def run_codex(
@@ -499,6 +571,7 @@ def run_opencode(
     verbose_logs: bool = False,
     extra_args: list[str] | None = None,
 ) -> bool:
+    wrapped_prompt = _opencode_prompt(prompt)
     cmd = [
         "opencode",
         "run",
@@ -507,7 +580,7 @@ def run_opencode(
         "--dangerously-skip-permissions",
         "--dir",
         str(cwd),
-        prompt,
+        wrapped_prompt,
     ]
     if extra_args:
         cmd.extend(extra_args)
@@ -517,6 +590,7 @@ def run_opencode(
         log_base=log_base,
         verbose_logs=verbose_logs,
         converter=opencode_event_to_archon_events,
+        idle_timeout_secs=300,
     )
 
 
